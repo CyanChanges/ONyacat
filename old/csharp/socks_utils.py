@@ -1,8 +1,12 @@
+#  Copyright (c) Cyan Changes 2024. All rights reserved.
+
 import asyncio
 from asyncio import AbstractEventLoop, Future
 from socket import socket
 from typing import Sequence, Callable, Coroutine
 from functools import partial
+
+from loguru import logger
 
 from structures import Remote, PackageType
 from util import unpack, pack
@@ -49,6 +53,7 @@ def abort(addr: Remote):
 
 async def abort_bad_package(sock: socket, addr: Remote, loop: AbstractEventLoop = None):
     abort(addr)
+    logger.debug("Bad package {}", Exception())
     return await send_pack_async(sock, addr, pack_type=PackageType.bad_package, loop=loop)
 
 

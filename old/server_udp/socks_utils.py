@@ -1,7 +1,10 @@
+#  Copyright (c) Cyan Changes 2024. All rights reserved.
+
 import asyncio
 from asyncio import AbstractEventLoop, Future
 from socket import socket
 from typing import Sequence, Callable, Coroutine
+from functools import partial
 
 from structures import Remote, PackageType
 from util import unpack, pack
@@ -40,22 +43,20 @@ async def recv_pack_async(
     return unpack(await recv_from(addr, loop=loop))
 
 
-async def _abort(addr: Remote, loop: AbstractEventLoop = None):
-    loop = asyncio.get_running_loop if loop is None else loop
+def abort(addr: Remote):
+    clients.discard(addr)
     if addr in receiver_waiters:
-        await receiver_waiters.pop(addr)
-    clients.remove(addr)
+        _ = receiver_waiters.pop(addr)
 
 
 async def abort_bad_package(sock: socket, addr: Remote, loop: AbstractEventLoop = None):
-    await _abort(addr, loop=loop)
+    abort(addr)
     return await send_pack_async(sock, addr, pack_type=PackageType.bad_package, loop=loop)
 
 
-async def abort_timeout(sock: socket, addr: Remote, loop: AbstractEventLoop = None):
-    loop = asyncio.get_running_loop() if loop is None else loop
-    await _abort(addr, loop=loop)
-    _ = loop.create_task(lambda: loop.sock_sendto(sock, pack(PackageType.timeout), addr))
+def abort_timeout(sock: socket, addr: Remote):
+    abort(addr)
+    asyncio.get_event_loop().call_soon(partial(send_pack, sock, addr, PackageType.timeout))
 
 
 async def receiver(

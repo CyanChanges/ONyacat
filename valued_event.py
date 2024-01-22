@@ -1,3 +1,5 @@
+#  Copyright (c) Cyan Changes 2024. All rights reserved.
+
 from asyncio import Event
 from typing import Generic, TypeVar
 
