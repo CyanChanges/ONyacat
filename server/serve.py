@@ -23,23 +23,24 @@ async def on_client_package(peer: Peer, package: Package):
 
 
 async def on_disconnect(peer: Peer):
-    pass
+    logger.warning('{} disconnect', peer)
 
 
-async def handshake(server: UDPLayer, peer: Peer):
+async def handshake(peer: Peer, package: Package):
     global csharp_event
-    logger.info('{} peer from {}:{}'.format(peer.type, *peer.addr))
+    server = peer.layer
+    logger.info('{} peer from {}:{}'.format(peer.type.name, *peer.addr))
     await server.send_package(Package(PackageType.handshake, [PeerType.server, pack_addr(peer.addr)]), peer.addr)
     if peer == PeerType.client:
         await csharp_event.wait()
-        server.on_package(peer.addr, partial(on_client_package, server))
+        server.on_package(peer, partial(on_client_package, server))
     else:
         csharp_event.set(peer.addr)
-        server.on_package(peer.addr, partial(on_csharp_package, server))
+        server.on_package(peer, partial(on_csharp_package, server))
 
 
 async def main(host: str = '0.0.0.0', port: int = 5100):
     logger.info("Listening on {}:{}", host, port)
     server = UDPServer((host, port))
-    server.on_handshake(partial(handshake, server))
+    server.on_handshake(handshake)
     await server.run()

@@ -74,7 +74,6 @@ def main(host="0.0.0.0", port=5100):
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
-        logger.success("Server stopped")
 
 
 if __name__ == "__main__":

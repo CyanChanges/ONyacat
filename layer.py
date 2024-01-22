@@ -2,29 +2,31 @@
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from asyncio import Task, Future, Queue, QueueEmpty
+from asyncio import Task, Future, Queue
 from collections import deque
 from datetime import timedelta
 from functools import partial
-from io import BytesIO
 from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, error as socket_error
 from typing import Protocol, Callable, Awaitable, Any, Literal, Optional, Coroutine
 
-from more_itertools import iter_except, take, first_true
-
 from log import logger
-from structures import Remote, Package, PackageType, Peer, PeerType, PeerIdentifier, PeerMeta, BoundedPeer
+from structures import Remote, Package, PackageType, Peer, PeerType, PeerIdentifier, BoundedPeer
 from util import pack_addr
 
 HandlerType = Literal["handshake"] | Literal['disconnect']
 
 QUEUE_SIZE_PER_REMOTE = 10
+MAX_PACK_SIZE = 20480
 
 
 class IConnectionLayer(Protocol):
+    timeout: timedelta
     peers: dict[PeerIdentifier, Peer]
     data_queues: Optional[dict[Remote, asyncio.StreamReader]]
-    timeout: timedelta
+
+    @property
+    def type(self) -> PeerType:
+        raise NotImplementedError
 
     def send_all(self, package: Package) -> Task:
         pass
@@ -50,7 +52,7 @@ class IConnectionLayer(Protocol):
 
 class UDPLayer(IConnectionLayer, ABC):
     def __init__(self, addr: Remote, timeout: timedelta = timedelta(seconds=5), loop: asyncio.AbstractEventLoop = None):
-        self.loop = asyncio.get_running_loop() if loop is None else loop
+        self.loop = asyncio.get_event_loop() if loop is None else loop
         self.timeout = timeout
         self.addr = addr
         self.socket = socket(AF_INET, SOCK_DGRAM)
@@ -59,9 +61,15 @@ class UDPLayer(IConnectionLayer, ABC):
         self._receivers: dict[Peer, deque[Callable[[Peer, Package], Awaitable]]] = {}
         self._handlers: dict[HandlerType, deque[Callable[[Peer], Awaitable] | Callable[[Peer, ...], Awaitable]]] = {}
         self.fut: Optional[Future] = None
+        self.processors: list[Coroutine] = []
         self.tasks = Queue(maxsize=40)
         self.data_queues: dict[Remote, asyncio.StreamReader] = {}
         self.awaitable = []
+
+    @property
+    @abstractmethod
+    def type(self) -> PeerType:
+        pass
 
     def on_package(self, peer: Peer, receiver: Callable[[Peer, Package], Awaitable], prepend: bool = False):
         receivers = self._receivers.get(peer, deque())
@@ -78,10 +86,10 @@ class UDPLayer(IConnectionLayer, ABC):
 
         return _wrapper
 
-    def on_handshake(self, func: Callable[[Peer], Awaitable]):
-        return self.on('disconnect')(func)
+    def on_handshake(self, func: Callable[[Peer, Package], Awaitable]):
+        return self.on('handshake')(func)
 
-    def on_disconnect(self, func: Callable[[Peer], Awaitable]):
+    def on_disconnect(self, func: Callable[[Peer, Any], Awaitable]):
         return self.on('disconnect')(func)
 
     def emit(self, handle_type: HandlerType, peer: Peer, *args: Any, **kwargs: Any) -> Awaitable:
@@ -95,15 +103,18 @@ class UDPLayer(IConnectionLayer, ABC):
     def _add_task(self, task: Task):
         return self.tasks.put(task)
 
+    def _add_processor(self, coro: Coroutine):
+        self.processors.append(coro)
+
     def _task(self, coro: Coroutine):
         task = asyncio.create_task(coro)
         return self._add_task(task)
 
     async def _process4one(self, remote: Remote):
         io = self.data_queues[remote]
+        peer = Peer(self, addr=remote)
         pack_bytes = await asyncio.wait_for(io.readuntil(b'\xff'), self.timeout.total_seconds() * 2)
         package = Package.from_bytes(pack_bytes, remote)
-        peer = Peer(self, addr=remote)
         match package.pack_type:
             case PackageType.handshake:
                 peer.handshake(package)
@@ -126,34 +137,45 @@ class UDPLayer(IConnectionLayer, ABC):
         except TimeoutError:
             await self.peer(addr=remote).timeout()
 
-    def _batch_tasks(self):
+    def _batch_process(self):
         cnt = 0
         tasks = deque()
         for remote in tuple(self.data_queues.keys()):
             if cnt > QUEUE_SIZE_PER_REMOTE:
-                yield tasks
+                cnt = 0
+                yield from tuple(tasks)
                 tasks.clear()
-            tasks.append(remote)
+            tasks.append(self._peer_data(remote))
             cnt += 1
+        if len(tasks) != 0:
+            yield from tuple(tasks)
 
-    async def process(self):
-        while True:
-            await asyncio.gather(*self._batch_tasks())
+    async def handle(self):
+        while not self.fut.done():
+            await asyncio.gather(*self._batch_process())
+            await asyncio.sleep(0)
 
-    async def recv_data(self, initial=b''):
+    async def _data(self, initial=b''):
         buffer = initial
         last_addr = None
-        while not buffer.endswith(b'\xff'):
+        sz = 0
+
+        while sz < MAX_PACK_SIZE and not buffer.endswith(b'\xff'):
             try:
                 data, addr = self.socket.recvfrom(4096)
+                sz += len(data)
                 if last_addr is None or last_addr == addr:
                     buffer += data
                     last_addr = addr
                 else:
-                    await self._task(self.recv_data(data))
+                    await self._task(self._data(data))
                     continue
             except socket_error:
-                break
+                await asyncio.sleep(0.1)
+                continue
+
+        if not last_addr:
+            return
 
         reader = self.data_queues.get(last_addr)
         if not reader:
@@ -162,8 +184,8 @@ class UDPLayer(IConnectionLayer, ABC):
 
     def _handle(self):
         if not self.tasks.full():
-            self.tasks.put_nowait(self.recv_data())
-        asyncio.get_event_loop().create_task(self.recv_data())
+            self.tasks.put_nowait(self._data())
+        asyncio.get_event_loop().create_task(self._data())
 
     async def send_package(self, package: Package, addr: Remote):
         await self.loop.sock_sendto(self.socket, package.encode(), addr)
@@ -171,10 +193,11 @@ class UDPLayer(IConnectionLayer, ABC):
     def send_all(self, package: Package):
         data = package.encode()
         return asyncio.gather(
-            *(self.loop.sock_sendto(self.socket, data, client.addr) for client in self.peers.values()))
+            *(self.loop.sock_sendto(self.socket, data, client.addr) for client in self.peers.values())
+        )
 
     async def heartbeat(self):
-        while True:
+        while not self.fut.done():
             await self.send_all(Package(
                 PackageType.heartbeat, random.randint(0, 255)
             ))
@@ -194,32 +217,37 @@ class UDPLayer(IConnectionLayer, ABC):
         self.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.socket.setblocking(False)
         self.fut = self.loop.create_future()
-        await self._task(self.process())
-        await self._task(self.heartbeat())
+
         await self.accept()
         await self.initialize()
+        self._add_processor(self.handle())
+        self._add_processor(self.heartbeat())
+        await self.process()
+
+    async def process(self):
+        async with asyncio.TaskGroup() as tg:
+            for coro in self.processors:
+                tg.create_task(coro)
 
     def close(self):
-        if self.fut:
+        if not self.fut:
             return
         self.fut.set_result(True)
 
     def start(self) -> Task:
         return asyncio.create_task(self._initial_task())
 
-    async def run(self):
-        await self.start()
-        tasks = deque()
-        while not self.fut.done():
-            if not self.tasks.empty():
-                await asyncio.gather(*(take(10, iter_except(lambda: self.tasks.get_nowait(), QueueEmpty))))
-            else:
-                await asyncio.sleep(0)
+    def run(self):
+        return self.start()
 
 
 class UDPServer(UDPLayer):
     def bind(self):
         self.socket.bind(self.addr)
+
+    @property
+    def type(self) -> PeerType:
+        return PeerType.client
 
     async def initialize(self):
         self.bind()
@@ -227,16 +255,19 @@ class UDPServer(UDPLayer):
 
 class UDPClient(UDPLayer):
     def __init__(
-            self, addr: Remote, peer_type: PeerType,
+            self, addr: Remote,
             timeout: timedelta = timedelta(seconds=5),
             loop: asyncio.AbstractEventLoop = None
     ):
-        self.type = peer_type
         super().__init__(addr, timeout, loop)
+
+    @property
+    def type(self) -> PeerType:
+        return PeerType.client
 
     async def initialize(self):
         await self.send_package(Package(PackageType.handshake, self.type), self.addr)
         self.on_handshake(self.handshake)
 
-    async def handshake(self, addr: Remote, peer_type: PeerType) -> None:
+    async def handshake(self, peer: Peer, package: Package) -> None:
         logger.info("Handshake")

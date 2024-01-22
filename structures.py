@@ -62,7 +62,7 @@ class PeerMeta:
     last_heartbeat: datetime = None
     networks: Sequence[Network] = None
 
-    def new(self) -> Self:
+    def setup(self) -> Self:
         self.networks = []
         self.last_heartbeat = datetime.now()
         return self
@@ -79,7 +79,9 @@ class Peer:
             layer: "IConnectionLayer",
             identifier: PeerIdentifier = None,
             addr: Remote = None,
-            meta: PeerMeta = None
+            meta: PeerMeta = None,
+            *args,
+            **kwargs
     ) -> "Peer":
         obj = None
         if identifier is not None:
@@ -87,7 +89,7 @@ class Peer:
             if addr is None:
                 raise NoSuchPeerError.identifier(identifier)
         if addr is not None:
-            obj = first_true(layer.peers, False, lambda x: x.addr == addr)
+            obj = first_true(layer.peers.values(), False, lambda x: x.addr == addr)
         if obj is None or obj is False:
             obj = object.__new__(cls)
         else:
@@ -103,20 +105,23 @@ class Peer:
             meta: PeerMeta = None
     ):
         self.meta = meta
+        self.merge(meta)
         if getattr(self, _SKIP_INIT, None):
             merge_meta: Optional[PeerMeta] = getattr(self, _MERGE_META, None)
             if not merge_meta:
                 return
             self.merge(merge_meta)
+            return
         if addr and identifier is None:
             identifier = uuid.uuid4()
-        if meta is None:
-            self.meta = PeerMeta().new()
         self.layer = layer
         self.identifier = identifier
         if not addr:
             raise NoSuchPeerError.identifier(identifier, self)
         self.addr = addr
+        if meta is None:
+            self.meta.setup()
+        self.layer.peers.update({self.identifier: self})
 
     # noinspection SpellCheckingInspection
     def weakref(self):
@@ -127,6 +132,8 @@ class Peer:
         return self.meta.type
 
     def merge(self, meta: PeerMeta):
+        if not self.meta:
+            self.meta = PeerMeta()
         if not meta:
             return
         for key in vars(meta).keys():
@@ -139,14 +146,18 @@ class Peer:
         self.heartbeat()
         self.layer.emit('handshake', self, package)
 
-    def disconnect(self):
+    def mark_disconnect(self):
         self.meta.disconnected = True
+        self.layer.emit("disconnect", self)
 
     def remove(self):
+        self.mark_disconnect()
         try:
-            self.layer.data_queues.pop(self.addr)
+            if self.addr in self.layer.data_queues:
+                self.layer.data_queues.pop(self.addr)
         finally:
-            self.layer.peers.pop(self.identifier)
+            if self.identifier in self.layer.peers:
+                self.layer.peers.pop(self.identifier)
 
     def __hash__(self):
         return hash(self.identifier)
@@ -160,17 +171,16 @@ class Peer:
     def __repr__(self):
         return f'Peer({getattr(self.meta.type, "name", "Unknown")}, {pack_addr(getattr(self, "addr", "???"))})'
 
-    @classmethod
-    def from_handshake(cls, layer: "IConnectionLayer", addr: Remote, data: bytes):
-        assert len(data) == 1
-        peer_type = PeerType(data[0])
-        return cls(layer, addr=addr, meta=PeerMeta(type=peer_type))
-
     def bad_package(self, reason: AnyStr):
         return self.layer.send_package(Package(PackageType.bad_package, reason), self.addr)
 
     def timeout(self):
+        self.remove()
         return self.layer.send_package(Package(PackageType.timeout), self.addr)
+
+    def disconnect(self):
+        self.mark_disconnect()
+        self.layer.send_package(Package(PackageType.wave_hand, self.layer.type), self.addr)
 
 
 class BoundedPeer(Protocol):
@@ -189,7 +199,7 @@ DataPack = AnyStr | int
 @dataclass(repr=True)
 class Package:
     pack_type: PackageType
-    _data: DataPack | Sequence[DataPack] = field(repr=False)
+    _data: DataPack | Sequence[DataPack] = field(repr=False, default=0)
     data: DataPack = field(init=False)
 
     def __post_init__(self):
