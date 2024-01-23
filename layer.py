@@ -8,6 +8,10 @@ from datetime import timedelta
 from functools import partial
 from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, error as socket_error
 from typing import Protocol, Callable, Awaitable, Any, Literal, Optional, Coroutine
+from globals import (
+    _cv_peer,
+    _cv_package
+)
 
 from log import logger
 from structures import Remote, Package, PackageType, Peer, PeerType, PeerIdentifier, BoundedPeer
@@ -46,7 +50,7 @@ class IConnectionLayer(Protocol):
     def package(self, peer: Peer, package: Package) -> Any:
         pass
 
-    def on_package(self, peer: Peer, receiver: Callable[[Peer, Package], Awaitable], prepend: bool = False):
+    def on_package(self, peer: Peer, receiver: Callable[[], Awaitable], prepend: bool = False):
         pass
 
 
@@ -58,8 +62,8 @@ class UDPLayer(IConnectionLayer, ABC):
         self.socket = socket(AF_INET, SOCK_DGRAM)
         self._running = False
         self.peers: dict[PeerIdentifier, Peer] = {}
-        self._receivers: dict[Peer, deque[Callable[[Peer, Package], Awaitable]]] = {}
-        self._handlers: dict[HandlerType, deque[Callable[[Peer], Awaitable] | Callable[[Peer, ...], Awaitable]]] = {}
+        self._receivers: dict[Peer, deque[Callable[[], Awaitable]]] = {}
+        self._handlers: dict[HandlerType, deque[Callable[[], Awaitable] | Callable[[...], Awaitable]]] = {}
         self.fut: Optional[Future] = None
         self.processors: list[Coroutine] = []
         self.tasks = Queue(maxsize=40)
@@ -71,7 +75,7 @@ class UDPLayer(IConnectionLayer, ABC):
     def type(self) -> PeerType:
         pass
 
-    def on_package(self, peer: Peer, receiver: Callable[[Peer, Package], Awaitable], prepend: bool = False):
+    def on_package(self, peer: Peer, receiver: Callable[[], Awaitable], prepend: bool = False):
         receivers = self._receivers.get(peer, deque())
         if prepend:
             receivers.appendleft(receiver)
@@ -79,28 +83,29 @@ class UDPLayer(IConnectionLayer, ABC):
             receivers.append(receiver)
 
     def on(self, handler_type: HandlerType):
-        def _wrapper(func: Callable[[Peer], Awaitable]):
+        def _wrapper(func: Callable[[], Awaitable]):
             self._handlers.setdefault(handler_type, deque())
             self._handlers[handler_type].append(func)
             return func
 
         return _wrapper
 
-    def on_handshake(self, func: Callable[[Peer, Package], Awaitable]):
+    def on_handshake(self, func: Callable[[], Awaitable]):
         return self.on('handshake')(func)
 
-    def on_disconnect(self, func: Callable[[Peer, Any], Awaitable]):
+    def on_disconnect(self, func: Callable[[], Awaitable]):
         return self.on('disconnect')(func)
 
     def emit(self, handle_type: HandlerType, peer: Peer, *args: Any, **kwargs: Any) -> Awaitable:
+        _cv_peer.set(peer)
         handlers = self._handlers.get(handle_type, ())
-        return asyncio.gather(*(handler(peer, *args, **kwargs) for handler in handlers))
+        return asyncio.gather(*(handler(*args, **kwargs) for handler in handlers))
 
     def package(self, peer: Peer, package: Package) -> Awaitable:
         receivers = self._receivers.get(peer, deque())
-        return asyncio.gather(*(receiver(peer, package) for receiver in receivers))
+        return asyncio.gather(*(receiver() for receiver in receivers))
 
-    def _add_task(self, task: Task):
+    def _add_task(self, task: Task | Future):
         return self.tasks.put(task)
 
     def _add_processor(self, coro: Coroutine):
@@ -112,16 +117,22 @@ class UDPLayer(IConnectionLayer, ABC):
 
     async def _process4one(self, remote: Remote):
         io = self.data_queues[remote]
+
         peer = Peer(self, addr=remote)
+        _cv_peer.set(peer)
+
         pack_bytes = await asyncio.wait_for(io.readuntil(b'\xff'), self.timeout.total_seconds() * 2)
+
         package = Package.from_bytes(pack_bytes, remote)
+        _cv_package.set(package)
+
         match package.pack_type:
             case PackageType.handshake:
-                peer.handshake(package)
+                await self._add_task(peer.to_handshake(package))
             case PackageType.peer_disconnected:
-                peer.disconnect()
+                await self._add_task(peer.to_disconnect())
             case PackageType.heartbeat:
-                peer.heartbeat()
+                peer.update_heartbeat()
                 logger.trace("Heartbeat from {}", pack_addr(remote))
             case _:
                 await self.package(peer, package)

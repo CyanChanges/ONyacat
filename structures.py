@@ -1,17 +1,23 @@
 #  Copyright (c) Cyan Changes 2024. All rights reserved.
+import asyncio
 import struct
 import uuid
 import weakref
+from asyncio import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import IntEnum
-from typing import AnyStr, Self, Optional, Sequence, Literal, Never, TYPE_CHECKING, Protocol
+from typing import AnyStr, Self, Optional, Sequence, Literal, Never, TYPE_CHECKING, Protocol, cast
 from uuid import UUID
 
-from loguru import logger
 from more_itertools import first_true
 
 from exceptions import InvalidPacakgeError, NoSuchPeerError
+
+from globals import (
+    _cv_package,
+    _cv_peer
+)
 
 if TYPE_CHECKING:
     from layer import IConnectionLayer
@@ -140,29 +146,31 @@ class Peer:
             if key is not None:
                 setattr(self.meta, key, getattr(meta, key))
 
-    def handshake(self, package: "Package"):
+    def to_handshake(self, package: "Package") -> Future:
         assert package.pack_type == PackageType.handshake, 'non handshake package'
         self.merge(PeerMeta(type=PeerType(package.data[0])))
-        self.heartbeat()
-        self.layer.emit('handshake', self, package)
+        self.update_heartbeat()
+        _cv_package.set(package)
+        return asyncio.ensure_future(self.layer.emit('handshake', self))
 
     def mark_disconnect(self):
         self.meta.disconnected = True
-        self.layer.emit("disconnect", self)
+        return self.layer.emit("disconnect", self)
 
     def remove(self):
-        self.mark_disconnect()
+        task = self.mark_disconnect()
         try:
             if self.addr in self.layer.data_queues:
                 self.layer.data_queues.pop(self.addr)
         finally:
             if self.identifier in self.layer.peers:
                 self.layer.peers.pop(self.identifier)
+        return task
 
     def __hash__(self):
         return hash(self.identifier)
 
-    def heartbeat(self):
+    def update_heartbeat(self):
         self.meta.last_heartbeat = datetime.now()
 
     def is_alive(self, timeout: timedelta) -> bool:
@@ -178,9 +186,11 @@ class Peer:
         self.remove()
         return self.layer.send_package(Package(PackageType.timeout), self.addr)
 
-    def disconnect(self):
-        self.mark_disconnect()
-        self.layer.send_package(Package(PackageType.wave_hand, self.layer.type), self.addr)
+    def to_disconnect(self):
+        return asyncio.gather(
+            self.mark_disconnect(),
+            self.layer.send_package(Package(PackageType.wave_hand, self.layer.type), self.addr)
+        )
 
 
 class BoundedPeer(Protocol):
@@ -201,6 +211,7 @@ class Package:
     pack_type: PackageType
     _data: DataPack | Sequence[DataPack] = field(repr=False, default=0)
     data: DataPack = field(init=False)
+    _peer: Peer = None
 
     def __post_init__(self):
         self.data = b''
@@ -213,6 +224,9 @@ class Package:
         else:
             b = self._data
             self.data += data_pack(b)
+
+    def peer(self, peer: Peer) -> None:
+        self._peer = peer
 
     def encode(self) -> bytes:
         return struct.pack('csc', self.pack_type.value.to_bytes(), self.data, b'\xff')

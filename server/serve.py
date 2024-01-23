@@ -9,24 +9,25 @@ from layer import UDPServer, UDPLayer
 from structures import PeerType, Remote, Package, PackageType, Peer
 from util import pack_addr
 from valued_event import ValuedEvent
+from globals import peer, package
 
 # csharp_addr: Optional[Remote] = None
 csharp_event = ValuedEvent()
 
 
-async def on_csharp_package(peer: Peer, package: Package):
+async def on_csharp_package():
     logger.info(f'package received {package}')
 
 
-async def on_client_package(peer: Peer, package: Package):
+async def on_client_package():
     pass
 
 
-async def on_disconnect(peer: Peer):
+async def on_disconnect():
     logger.warning('{} disconnect', peer)
 
 
-async def handshake(peer: Peer, package: Package):
+async def handshake():
     global csharp_event
     server = peer.layer
     logger.info('{} peer from {}:{}'.format(peer.type.name, *peer.addr))
