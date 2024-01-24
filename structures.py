@@ -3,24 +3,23 @@ import asyncio
 import struct
 import uuid
 import weakref
-from asyncio import Future
-from dataclasses import dataclass, field
+from asyncio import Future, Task
+from dataclasses import InitVar
 from datetime import datetime, timedelta
 from enum import IntEnum
-from typing import AnyStr, Self, Optional, Sequence, Literal, Never, TYPE_CHECKING, Protocol, cast
+from typing import AnyStr, Self, Optional, Sequence, Literal, Never, Protocol, Any, Awaitable, Callable, TypeVar, \
+    Coroutine
 from uuid import UUID
 
 from more_itertools import first_true
+from pydantic import GetCoreSchemaHandler, BaseModel, Field
+from pydantic.dataclasses import dataclass
+from pydantic_core import CoreSchema, core_schema
 
 from exceptions import InvalidPacakgeError, NoSuchPeerError
-
 from globals import (
-    _cv_package,
-    _cv_peer
+    _cv_package
 )
-
-if TYPE_CHECKING:
-    from layer import IConnectionLayer
 from util import pack_addr, data_pack
 
 BASIC_PACK_SIZE = 2
@@ -55,10 +54,57 @@ class PeerType(IntEnum):
     server = 0x3  # the server broadcast ip address of peers
 
 
-@dataclass(slots=True)
-class Network:
-    layer: "IConnectionLayer"
-    peers: Sequence["Peer"] = field(default_factory=set)
+HandlerType = Literal["handshake", 'disconnect', 'heartbeat']
+
+PeerIdentifier = UUID
+
+
+class ConnectionLayerModel(BaseModel):
+    timeout: timedelta
+    peers: dict[PeerIdentifier, "Peer"]
+    data_queues: Optional[dict[Remote, Any]]
+
+
+class ConnectionLayer(Protocol):
+    timeout: timedelta
+    peers: dict[PeerIdentifier, "Peer"]
+    data_queues: Optional[dict[Remote, asyncio.StreamReader]]
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+    ):
+        return core_schema.no_info_after_validator_function(cls, handler(ConnectionLayerModel))
+
+    @property
+    def type(self) -> PeerType:
+        raise NotImplementedError
+
+    def send_all(self, package: "Package") -> Task:
+        pass
+
+    async def send_package(self, package: "Package", addr: Remote):
+        pass
+
+    async def recv_package(self, addr: Remote):
+        pass
+
+    def emit(self, handle_type: HandlerType, peer: "Peer", *args: Any, **kwargs: Any) -> Future:
+        pass
+
+    def on(self, handler_type: HandlerType) -> Callable[[Callable], Callable]:
+        pass
+
+    def package(self, peer: "Peer", package: "Package") -> Any:
+        pass
+
+    def on_package(self, peer: "Peer", receiver: Callable[[], Awaitable], prepend: bool = False):
+        pass
+
+    _T1 = TypeVar("_T1", Task, Future)
+
+    def task(self, task: _T1) -> _T1:
+        pass
 
 
 @dataclass
@@ -66,7 +112,7 @@ class PeerMeta:
     type: PeerType = None
     disconnected: bool = None
     last_heartbeat: datetime = None
-    networks: Sequence[Network] = None
+    networks: Sequence["Network"] = None
 
     def setup(self) -> Self:
         self.networks = []
@@ -74,15 +120,41 @@ class PeerMeta:
         return self
 
 
-PeerIdentifier = UUID
+class PeerModel(BaseModel):
+    identifier: PeerIdentifier
+    addr: Remote
+    meta: PeerMeta
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, handler(cls))
+
+
+class Network(BaseModel):
+    layer: ConnectionLayer
+    peers: Sequence["Peer"] = Field(default_factory=set)
+
+
 _SKIP_INIT = '__skip_init'
 _MERGE_META = '__merge_meta'
+
+
+async def _await_in_order(t1: Awaitable, t2: Awaitable = None):
+    await t1,
+    if t2 is not None:
+        await t2
+
+
+def to_task(coro: Coroutine):
+    return asyncio.create_task(coro)
 
 
 class Peer:
     def __new__(
             cls,
-            layer: "IConnectionLayer",
+            layer: ConnectionLayer,
             identifier: PeerIdentifier = None,
             addr: Remote = None,
             meta: PeerMeta = None,
@@ -103,9 +175,15 @@ class Peer:
             setattr(obj, _MERGE_META, meta)
         return obj
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, handler(PeerModel))
+
     def __init__(
             self,
-            layer: "IConnectionLayer",
+            layer: ConnectionLayer,
             identifier: PeerIdentifier = None,
             addr: Remote = None,
             meta: PeerMeta = None
@@ -146,32 +224,40 @@ class Peer:
             if key is not None:
                 setattr(self.meta, key, getattr(meta, key))
 
-    def to_handshake(self, package: "Package") -> Future:
+    def to_handshake(self, package: "Package"):
         assert package.pack_type == PackageType.handshake, 'non handshake package'
         self.merge(PeerMeta(type=PeerType(package.data[0])))
         self.update_heartbeat()
         _cv_package.set(package)
-        return asyncio.ensure_future(self.layer.emit('handshake', self))
+        return self.layer.task(to_task(_await_in_order(
+            self.layer.emit('handshake', self)
+        )))
 
     def mark_disconnect(self):
         self.meta.disconnected = True
         return self.layer.emit("disconnect", self)
 
-    def remove(self):
-        task = self.mark_disconnect()
+    def remove(self) -> Future:
+        future = asyncio.ensure_future(self.mark_disconnect())
         try:
             if self.addr in self.layer.data_queues:
                 self.layer.data_queues.pop(self.addr)
         finally:
             if self.identifier in self.layer.peers:
                 self.layer.peers.pop(self.identifier)
-        return task
+        return future
 
     def __hash__(self):
         return hash(self.identifier)
 
     def update_heartbeat(self):
         self.meta.last_heartbeat = datetime.now()
+
+    def to_heartbeat(self):
+        self.update_heartbeat()
+        return to_task(_await_in_order(
+            self.layer.emit("heartbeat", self)
+        ))
 
     def is_alive(self, timeout: timedelta) -> bool:
         return (not self.meta.disconnected) and datetime.now() - self.meta.last_heartbeat < timeout
@@ -183,14 +269,24 @@ class Peer:
         return self.layer.send_package(Package(PackageType.bad_package, reason), self.addr)
 
     def timeout(self):
-        self.remove()
-        return self.layer.send_package(Package(PackageType.timeout), self.addr)
+        return self.layer.task(to_task(_await_in_order(
+            self.remove(),
+            self.layer.send_package(Package(PackageType.timeout), self.addr)
+        )))
 
     def to_disconnect(self):
-        return asyncio.gather(
+        """
+        peer ask for disconnecting
+        :return: disconnect task
+        """
+        return self.layer.task(to_task(_await_in_order(
             self.mark_disconnect(),
             self.layer.send_package(Package(PackageType.wave_hand, self.layer.type), self.addr)
-        )
+        )))
+
+
+Network.model_rebuild()
+PeerModel.model_rebuild()
 
 
 class BoundedPeer(Protocol):
@@ -209,23 +305,23 @@ DataPack = AnyStr | int
 @dataclass(repr=True)
 class Package:
     pack_type: PackageType
-    _data: DataPack | Sequence[DataPack] = field(repr=False, default=0)
-    data: DataPack = field(init=False)
-    _peer: Peer = None
+    data: DataPack = Field(init_var=False, default=0)
+    _peer: Optional[Peer] = None
 
     def __post_init__(self):
+        _data = self.data
         self.data = b''
-        if isinstance(self._data, bytes):
-            self.data = self._data
+        if isinstance(_data, bytes):
+            self.data = _data
             return
-        if isinstance(self._data, list | tuple):
-            for b in self._data:
+        if isinstance(_data, list | tuple):
+            for b in _data:
                 self.data += data_pack(b)
         else:
-            b = self._data
+            b = _data
             self.data += data_pack(b)
 
-    def peer(self, peer: Peer) -> None:
+    def bind(self, peer: Peer) -> None:
         self._peer = peer
 
     def encode(self) -> bytes:

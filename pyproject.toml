@@ -11,8 +11,11 @@ loguru = "^0.7.2"
 watchdog = "^3.0.0"
 rich = "^13.7.0"
 more-itertools = "^10.2.0"
-pydantic = "^1.10.0"
+pydantic = "^2.5.3"
 contextlocal = "^0.1.2"
+rtoml = "^0.10.0"
+pydantic-settings = "^2.1.0"
+typer = {extras = ["all"], version = "^0.9.0"}
 
 
 [build-system]

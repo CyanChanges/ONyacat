@@ -5,6 +5,8 @@ from typing import Optional
 from loguru import logger
 
 from functools import partial
+
+from config import ServerConfig
 from layer import UDPServer, UDPLayer
 from structures import PeerType, Remote, Package, PackageType, Peer
 from util import pack_addr
@@ -24,13 +26,17 @@ async def on_client_package():
 
 
 async def on_disconnect():
-    logger.warning('{} disconnect', peer)
+    logger.info('{} disconnect', peer)
 
 
-async def handshake():
+async def on_heartbeat():
+    logger.trace(f'heartbeat received {peer}')
+
+
+async def on_handshake():
     global csharp_event
     server = peer.layer
-    logger.info('{} peer from {}:{}'.format(peer.type.name, *peer.addr))
+    logger.info('{} handshake'.format(peer, *peer.addr))
     await server.send_package(Package(PackageType.handshake, [PeerType.server, pack_addr(peer.addr)]), peer.addr)
     if peer == PeerType.client:
         await csharp_event.wait()
@@ -40,8 +46,10 @@ async def handshake():
         server.on_package(peer, partial(on_csharp_package, server))
 
 
-async def main(host: str = '0.0.0.0', port: int = 5100):
-    logger.info("Listening on {}:{}", host, port)
-    server = UDPServer((host, port))
-    server.on_handshake(handshake)
+async def main(config: ServerConfig):
+    logger.info("Listening on {}:{}", config.bind.host, config.bind.port)
+    server = UDPServer((config.bind.host, config.bind.port))
+    server.on_handshake(on_handshake)
+    server.on_disconnect(on_disconnect)
+    server.on_heartbeat(on_heartbeat)
     await server.run()

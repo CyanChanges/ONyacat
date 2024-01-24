@@ -1,4 +1,4 @@
 #  Copyright (c) Cyan Changes 2024. All rights reserved.
 
-async def main(host='r.cyans.me', port=5100):
+async def main(config: CSharpConfig):
     return -1

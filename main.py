@@ -1,23 +1,37 @@
 #  Copyright (c) Cyan Changes 2024. All rights reserved.
 import asyncio
-import sys
 from asyncio import AbstractEventLoop
-from typing import Literal, Any
+from pathlib import Path
+from typing import Any
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 
+import typer
 from loguru import logger
 
+from settings import Settings
+from structures import PeerType
 
-def main(type: Literal['server'] | Literal['client'] = 'server', host="0.0.0.0", port=5100):
-    if type == "server":
-        from server.serve import main
-    else:
-        from csharp.serve import main
-    loop = asyncio.get_event_loop()
+app = typer.Typer()
+
+def run_peer(peer_type: PeerType, settings: Settings) -> None:
+    match peer_type:
+        case PeerType.server:
+            from server.serve import main
+        case PeerType.csharp:
+            from csharp.serve import main
+        case _:
+            raise ValueError(f"{peer_type} is not supported yet")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.set_exception_handler(
         lambda _, data: logger.opt(exception=data.get('exception')).warning('Error', data)
     )
+
     try:
-        sys.exit(loop.run_until_complete(main(host, port)))
+        logger.info(f"Running {peer_type.name}...")
+        return loop.run_until_complete(main(getattr(settings, peer_type.name)))
     except KeyboardInterrupt:
         logger.info("Attempting graceful shutdown, press Ctrl+C again to force exit…", flush=True)
 
@@ -45,7 +59,27 @@ def main(type: Literal['server'] | Literal['client'] = 'server', host="0.0.0.0",
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
-        logger.success("Server stopped")
+        logger.info(f"worker-{peer_type.name} stopped")
 
 
-main()
+@app.command('run')
+def main():
+    settings = Settings(Path(typer.get_app_dir('onyacat')) / 'config.toml')
+
+    futures = []
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        if settings.server:
+            futures.append(executor.submit(run_peer, PeerType.server, settings))
+        if settings.csharp:
+            futures.append(executor.submit(run_peer, PeerType.csharp, settings))
+
+    # raise exceptions
+    exceptions = [future.exception() for future in futures if future.exception()]
+    if len(exceptions):
+        raise ExceptionGroup('Exceptions during running', exceptions)
+
+
+
+if __name__ == "__main__":
+    typer.run(main)

@@ -2,59 +2,34 @@
 import asyncio
 import random
 from abc import ABC, abstractmethod
-from asyncio import Task, Future, Queue
+from asyncio import Task, Future
 from collections import deque
+from contextvars import Context
 from datetime import timedelta
 from functools import partial
 from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, error as socket_error
-from typing import Protocol, Callable, Awaitable, Any, Literal, Optional, Coroutine
+from typing import Callable, Awaitable, Any, Optional, Coroutine, cast
+
 from globals import (
     _cv_peer,
     _cv_package
 )
-
-from log import logger
-from structures import Remote, Package, PackageType, Peer, PeerType, PeerIdentifier, BoundedPeer
-from util import pack_addr
-
-HandlerType = Literal["handshake"] | Literal['disconnect']
+from structures import Remote, Package, PackageType, Peer, PeerType, PeerIdentifier, BoundedPeer, ConnectionLayer, \
+    HandlerType
+from util import is_coroutine_callable, run_sync
 
 QUEUE_SIZE_PER_REMOTE = 10
 MAX_PACK_SIZE = 20480
 
 
-class IConnectionLayer(Protocol):
-    timeout: timedelta
-    peers: dict[PeerIdentifier, Peer]
-    data_queues: Optional[dict[Remote, asyncio.StreamReader]]
-
-    @property
-    def type(self) -> PeerType:
-        raise NotImplementedError
-
-    def send_all(self, package: Package) -> Task:
-        pass
-
-    async def send_package(self, package: Package, addr: Remote):
-        pass
-
-    async def recv_package(self, addr: Remote):
-        pass
-
-    def emit(self, handle_type: HandlerType, peer: Peer, *args: Any, **kwargs: Any) -> Awaitable:
-        pass
-
-    def on(self, handler_type: HandlerType) -> Callable[[Callable], Callable]:
-        pass
-
-    def package(self, peer: Peer, package: Package) -> Any:
-        pass
-
-    def on_package(self, peer: Peer, receiver: Callable[[], Awaitable], prepend: bool = False):
-        pass
+def _transform_handler(func: Callable[[], Awaitable]):
+    if is_coroutine_callable(func):
+        return cast(Callable[..., Awaitable], func)
+    else:
+        return run_sync(cast(Callable[..., Any], func))
 
 
-class UDPLayer(IConnectionLayer, ABC):
+class UDPLayer(ConnectionLayer, ABC):
     def __init__(self, addr: Remote, timeout: timedelta = timedelta(seconds=5), loop: asyncio.AbstractEventLoop = None):
         self.loop = asyncio.get_event_loop() if loop is None else loop
         self.timeout = timeout
@@ -66,7 +41,7 @@ class UDPLayer(IConnectionLayer, ABC):
         self._handlers: dict[HandlerType, deque[Callable[[], Awaitable] | Callable[[...], Awaitable]]] = {}
         self.fut: Optional[Future] = None
         self.processors: list[Coroutine] = []
-        self.tasks = Queue(maxsize=40)
+        self.tasks: set[Task | Future] = set()
         self.data_queues: dict[Remote, asyncio.StreamReader] = {}
         self.awaitable = []
 
@@ -96,24 +71,28 @@ class UDPLayer(IConnectionLayer, ABC):
     def on_disconnect(self, func: Callable[[], Awaitable]):
         return self.on('disconnect')(func)
 
-    def emit(self, handle_type: HandlerType, peer: Peer, *args: Any, **kwargs: Any) -> Awaitable:
+    def on_heartbeat(self, func: Callable[[], Awaitable]):
+        return self.on('heartbeat')(func)
+
+    def emit(self, handle_type: HandlerType, peer: Peer, *args: Any, **kwargs: Any) -> Future:
         _cv_peer.set(peer)
         handlers = self._handlers.get(handle_type, ())
-        return asyncio.gather(*(handler(*args, **kwargs) for handler in handlers))
+        return asyncio.gather(*(handler(*args, **kwargs) for handler in map(_transform_handler, handlers)))
 
     def package(self, peer: Peer, package: Package) -> Awaitable:
         receivers = self._receivers.get(peer, deque())
         return asyncio.gather(*(receiver() for receiver in receivers))
 
-    def _add_task(self, task: Task | Future):
-        return self.tasks.put(task)
+    def task(self, task: Task):
+        self.tasks.add(task)
+        return task
+
+    def _schedule(self, coro: Coroutine, context: Context = None):
+        task = asyncio.create_task(coro, context=context)
+        return self.task(task)
 
     def _add_processor(self, coro: Coroutine):
         self.processors.append(coro)
-
-    def _task(self, coro: Coroutine):
-        task = asyncio.create_task(coro)
-        return self._add_task(task)
 
     async def _process4one(self, remote: Remote):
         io = self.data_queues[remote]
@@ -124,18 +103,19 @@ class UDPLayer(IConnectionLayer, ABC):
         pack_bytes = await asyncio.wait_for(io.readuntil(b'\xff'), self.timeout.total_seconds() * 2)
 
         package = Package.from_bytes(pack_bytes, remote)
+        package.bind(peer)
         _cv_package.set(package)
 
         match package.pack_type:
             case PackageType.handshake:
-                await self._add_task(peer.to_handshake(package))
+                peer.to_handshake(package)
             case PackageType.peer_disconnected:
-                await self._add_task(peer.to_disconnect())
+                peer.to_disconnect()
             case PackageType.heartbeat:
-                peer.update_heartbeat()
-                logger.trace("Heartbeat from {}", pack_addr(remote))
+                peer.to_heartbeat()
             case _:
                 await self.package(peer, package)
+
         await asyncio.sleep(0)
 
     @property
@@ -194,9 +174,7 @@ class UDPLayer(IConnectionLayer, ABC):
         reader.feed_data(buffer)
 
     def _handle(self):
-        if not self.tasks.full():
-            self.tasks.put_nowait(self._data())
-        asyncio.get_event_loop().create_task(self._data())
+        self._schedule(self._data())
 
     async def send_package(self, package: Package, addr: Remote):
         await self.loop.sock_sendto(self.socket, package.encode(), addr)
@@ -240,6 +218,8 @@ class UDPLayer(IConnectionLayer, ABC):
             for coro in self.processors:
                 tg.create_task(coro)
 
+        await self.fut
+
     def close(self):
         if not self.fut:
             return
@@ -267,18 +247,16 @@ class UDPServer(UDPLayer):
 class UDPClient(UDPLayer):
     def __init__(
             self, addr: Remote,
+            client_type: PeerType.client | PeerType.csharp,
             timeout: timedelta = timedelta(seconds=5),
             loop: asyncio.AbstractEventLoop = None
     ):
         super().__init__(addr, timeout, loop)
+        self.client_type = client_type
 
     @property
     def type(self) -> PeerType:
-        return PeerType.client
+        return self.client_type
 
     async def initialize(self):
         await self.send_package(Package(PackageType.handshake, self.type), self.addr)
-        self.on_handshake(self.handshake)
-
-    async def handshake(self, peer: Peer, package: Package) -> None:
-        logger.info("Handshake")
